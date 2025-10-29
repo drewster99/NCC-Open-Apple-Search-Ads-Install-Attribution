@@ -22,7 +22,7 @@ import Foundation
 
 public extension NCCOpenAppleSearchAdsInstallAttribution {
     /// An Apple Search Ads install attribution payload
-    struct AttributionPayload: Codable, Equatable {
+    struct AttributionPayload: Codable, Equatable, Sendable {
         public init(attribution: Bool, orgId: Int, campaignId: Int, conversionType: String, clickDate: String? = nil, adGroupId: Int, countryOrRegion: String, keywordId: Int? = nil, adId: Int? = nil) {
             self.attribution = attribution
             self.orgId = orgId

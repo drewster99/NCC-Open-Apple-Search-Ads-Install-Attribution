@@ -26,6 +26,7 @@ import OSLog
 private let logger = Logger(subsystem: "NCCOpenAppleSearchAdsInstallAttribution", category: "NCCOpenAppleSearchAdsInstallAttribution")
 
 /// Fetches advertising install attribution record for app instances that were installed with Apple Search Ads
+@MainActor
 public class NCCOpenAppleSearchAdsInstallAttribution: ObservableObject {
 
     /// An error in fetching ad attribution record
@@ -90,7 +91,7 @@ public class NCCOpenAppleSearchAdsInstallAttribution: ObservableObject {
     }
 
     /// Fetches the app's attribution token, returning it as a `String` or throwing if an error occurs
-    private func getAttributionToken() async throws -> String {
+    private nonisolated func getAttributionToken() async throws -> String {
         // Several forum posts (stackoverflow and apple developer forums) mentioned
         // delays or hangs when calling `AAAttribution.attributionToken()`, with
         // questions as to if the call performs network requests in some way.
@@ -119,7 +120,7 @@ public class NCCOpenAppleSearchAdsInstallAttribution: ObservableObject {
     /// This result can be `nil` if the API call succeeds (HTTP status code 200) and the result is
     /// a JSON dictionary, but the top-level of the dictionary does not contain an `attribution`
     /// key, or the value of that key is anything other than `true`.
-    private func fetchAttributionRecord(_ token: String) async throws -> AttributionPayload? {
+    private nonisolated func fetchAttributionRecord(_ token: String) async throws -> AttributionPayload? {
         logger.debug("Fetching attribution record")
         let url = URL(string: "https://api-adservices.apple.com/api/v1/")!
 
@@ -228,24 +229,22 @@ public class NCCOpenAppleSearchAdsInstallAttribution: ObservableObject {
         self.onAttributionPayloadLoaded = onAttributionPayloadLoaded
         self.onNewAttributionPayloadReceived = onNewAttributionPayloadReceived
 
-        Task.detached {
+        Task {
+            // Load saved attribution payload if exists
             if let savedAttributionPayload = self.savedAttributionPayload {
-                DispatchQueue.main.async {
-                    self.attributionPayload = savedAttributionPayload
-                    self.onAttributionPayloadLoaded(savedAttributionPayload)
-                }
+                self.attributionPayload = savedAttributionPayload
+                self.onAttributionPayloadLoaded(savedAttributionPayload)
             }
+
             do {
                 let token = try await self.getAttributionToken()
                 do {
                     let payload = try await self.fetchAttributionRecord(token)
                     if let payload, payload != self.savedAttributionPayload {
-                        DispatchQueue.main.async {
-                            self.attributionPayload = payload
-                            self.savedAttributionPayload = payload
-                            self.onAttributionPayloadLoaded(payload)
-                            self.onNewAttributionPayloadReceived(payload)
-                        }
+                        self.attributionPayload = payload
+                        self.savedAttributionPayload = payload
+                        self.onAttributionPayloadLoaded(payload)
+                        self.onNewAttributionPayloadReceived(payload)
                     }
                 } catch {
                     logger.error("Error fetching ad attribution record: \(error)")
