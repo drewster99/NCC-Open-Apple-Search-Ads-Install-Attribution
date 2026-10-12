@@ -18,7 +18,7 @@
 //
 
 import Foundation
-import SwiftUI
+import Combine
 import AdServices
 import OSLog
 
@@ -44,9 +44,8 @@ public class NCCOpenAppleSearchAdsInstallAttribution: ObservableObject {
         /// Token is invalid
         case status400InvalidToken = "Token is invalid"
 
-        /// Tokens have TTL of 24 hours.   This error is returned if the API call exceeds 24 hours.
-        /// If the token is valid, a best practice is to initiate retries at intervals of 5 seconds, with a
-        /// maximum of 3 attempts.
+        /// No record was found, either because it isn't available yet or because the token is more than
+        /// 24 hours old.  Thrown only after Apple's recommended retries (3 attempts, 5 seconds apart) fail.
         case status404NotFound = "No record found for token"
 
         /// Your request might be valid, but you'll need to retry it later
@@ -61,10 +60,10 @@ public class NCCOpenAppleSearchAdsInstallAttribution: ObservableObject {
     /// The most recent `Error`, if any, or `nil`, if no error has occurred
     @Published public var error: Swift.Error?
 
-    private var savedAttributionPayloadUserDefaultsKey = "NCCOpenAppleSearchAdsInstallAttribution_savedAttributionPayload"
+    private static let savedAttributionPayloadUserDefaultsKey = "NCCOpenAppleSearchAdsInstallAttribution_savedAttributionPayload"
     private var savedAttributionPayload: AttributionPayload? {
         get {
-            guard let data = UserDefaults.standard.data(forKey: savedAttributionPayloadUserDefaultsKey) else {
+            guard let data = userDefaults.data(forKey: Self.savedAttributionPayloadUserDefaultsKey) else {
                 return nil
             }
             do {
@@ -77,12 +76,12 @@ public class NCCOpenAppleSearchAdsInstallAttribution: ObservableObject {
         }
         set {
             guard let newValue else {
-                UserDefaults.standard.removeObject(forKey: savedAttributionPayloadUserDefaultsKey)
+                userDefaults.removeObject(forKey: Self.savedAttributionPayloadUserDefaultsKey)
                 return
             }
             do {
                 let data = try JSONEncoder().encode(newValue)
-                UserDefaults.standard.setValue(data, forKey: savedAttributionPayloadUserDefaultsKey)
+                userDefaults.set(data, forKey: Self.savedAttributionPayloadUserDefaultsKey)
             } catch {
                 logger.error("Unable to JSON encode savedAttributionPayload for saving: \(error)")
                 return
@@ -90,102 +89,112 @@ public class NCCOpenAppleSearchAdsInstallAttribution: ObservableObject {
         }
     }
 
+    /// Runs `AAAttribution.attributionToken()`, which is synchronous and has been reported to stall
+    /// (Apple doesn't document whether it touches the network), so it must not block a Swift Concurrency thread.
+    nonisolated private static let attributionTokenQueue = DispatchQueue(label: "NCCOpenAppleSearchAdsInstallAttribution.attributionToken")
+
+    /// Apple's attribution API endpoint
+    nonisolated private static let attributionAPIURLString = "https://api-adservices.apple.com/api/v1/"
+
     /// Fetches the app's attribution token, returning it as a `String` or throwing if an error occurs
-    private nonisolated func getAttributionToken() async throws -> String {
-        // Several forum posts (stackoverflow and apple developer forums) mentioned
-        // delays or hangs when calling `AAAttribution.attributionToken()`, with
-        // questions as to if the call performs network requests in some way.
-        // Apple's documentation is mum on the matter.
-        // In any case, we run this detached to avoid any strangeness in that way.
+    nonisolated static func getAttributionToken() async throws -> String {
         logger.debug("Requesting ad attribution token")
-        let attributionTokenTask = Task.detached {
-            try AAAttribution.attributionToken()
+        let token = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Swift.Error>) in
+            attributionTokenQueue.async {
+                continuation.resume(with: Result { try AAAttribution.attributionToken() })
+            }
         }
-        let token = try await attributionTokenTask.value
-        logger.debug("Received ad attribution token: \(token)")
+        logger.debug("Received ad attribution token: \(token, privacy: .private)")
         return token
     }
 
-    /// Given an Apple Search Ads attribution `token` `String`, attempts to asynchronously
-    /// fetch an attribution record from Apple's v1 API endpoint.
+    /// Fetches the attribution record for `token` from Apple's API, retrying a 404 per `notFoundRetryPolicy`.
     ///
-    /// When running on Simulator or from Xcode, Apple's API returns what is essentially
-    /// a mock payload (see `isMockData`), though this particular mock data isn't
-    /// documented as a guaranteed response.  In any case, we detect it as a mock data
-    /// response and throw `AttributionPayloadFetchError.mockDataReceived` in
-    /// that situation.
+    /// Apple answers 404 when the record isn't available yet, which is common right after install, so a 404 is
+    /// retried. Every other failure is thrown immediately.
     ///
-    /// If all goes well, we return an optional `AttributionPayload`.
+    /// - Returns: The payload, or `nil` if Apple reports the install as not attributed (`attribution` is `false`).
+    /// - Throws: `AttributionPayloadFetchError`, a `URLError`, a `DecodingError` for a malformed response, or
+    ///   `CancellationError` if cancelled while waiting to retry.
+    nonisolated static func fetchAttributionRecord(_ token: String, using urlSession: URLSession, notFoundRetryPolicy: NotFoundRetryPolicy) async throws -> AttributionPayload? {
+        var attempt = 1
+        while true {
+            do {
+                return try await requestAttributionRecord(token, using: urlSession)
+            } catch AttributionPayloadFetchError.status404NotFound where attempt < notFoundRetryPolicy.maximumAttempts {
+                logger.log("No attribution record yet (attempt \(attempt) of \(notFoundRetryPolicy.maximumAttempts)); retrying in \(notFoundRetryPolicy.delay)")
+                try await Task.sleep(for: notFoundRetryPolicy.delay)
+                attempt += 1
+            }
+        }
+    }
+
+    /// The `attribution` flag Apple includes in every successful response, attributed or not
+    private struct AttributionStatus: Decodable {
+        let attribution: Bool
+    }
+
+    /// Makes a single request to Apple's attribution API for `token`.
     ///
-    /// This result can be `nil` if the API call succeeds (HTTP status code 200) and the result is
-    /// a JSON dictionary, but the top-level of the dictionary does not contain an `attribution`
-    /// key, or the value of that key is anything other than `true`.
-    private nonisolated func fetchAttributionRecord(_ token: String) async throws -> AttributionPayload? {
+    /// When developer mode is on, Apple's API returns a test payload (see `isMockData`). We detect it and throw
+    /// `AttributionPayloadFetchError.mockDataReceived` rather than report it as a real attribution.
+    private nonisolated static func requestAttributionRecord(_ token: String, using urlSession: URLSession) async throws -> AttributionPayload? {
         logger.debug("Fetching attribution record")
-        let url = URL(string: "https://api-adservices.apple.com/api/v1/")!
+        guard let url = URL(string: attributionAPIURLString) else {
+            throw URLError(.badURL)
+        }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("text/plain", forHTTPHeaderField: "Content-Type")
-        request.httpBody = token.data(using: .utf8)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        request.httpBody = Data(token.utf8)
+        let (data, response) = try await urlSession.data(for: request)
         guard let urlResponse = response as? HTTPURLResponse else {
-            // throw
-            fatalError("Response is not HTTPURLResponse")
+            throw AttributionPayloadFetchError.responseIsNotHTTPURLResponse
         }
 
-        logger.debug("HTTP status code: \(urlResponse.statusCode).  All headers: \(urlResponse.allHeaderFields)")
+        logger.debug("HTTP status code: \(urlResponse.statusCode)")
 
-        /// Logs JSON and non-JSON responses
-        func logJSON() {
-            guard let jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                if let text = String(data: data, encoding: .utf8) {
-                    logger.log("Non-JSON response: \(text)")
-                } else {
-                    logger.log("Non-JSON, non-text response data of \(data.count) bytes")
-                }
-                return
+        func logResponseBody() {
+            logger.log("Response body (\(data.count) bytes): \(String(decoding: data, as: UTF8.self), privacy: .private)")
+        }
+
+        func decode<Decoded: Decodable>(_ type: Decoded.Type) throws -> Decoded {
+            do {
+                return try JSONDecoder().decode(type, from: data)
+            } catch {
+                logger.error("Unable to decode attribution response: \(error)")
+                logResponseBody()
+                throw error
             }
-            logger.debug("JSON object is \(jsonObject)")
         }
 
         switch urlResponse.statusCode {
         case 200:
-            // successful response
-            let jsonObject = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-            if let attribution = jsonObject["attribution"] as? Bool, attribution == true {
-                let payload = try JSONDecoder().decode(AttributionPayload.self, from: data)
-                let payloadText = "\(payload)"
-                if payload.isMockData {
-                    logger.warning("Attribution received.  *** MOCK PAYLOAD: \(payloadText)")
-                    logJSON()
-                    throw AttributionPayloadFetchError.mockDataReceived
-                } else {
-                    logger.log("Attribution received.  Payload: \(payloadText)")
-                    return payload
-                }
-            } else {
-                logger.log("API call successful, but `attribution` key is missing or has a non-`true` value")
-                logJSON()
+            guard try decode(AttributionStatus.self).attribution else {
+                logger.log("API call successful; install is not attributed")
                 return nil
             }
+            let payload = try decode(AttributionPayload.self)
+            if payload.isMockData {
+                logger.warning("Attribution received.  *** MOCK PAYLOAD: \(String(describing: payload), privacy: .private)")
+                throw AttributionPayloadFetchError.mockDataReceived
+            }
+            logger.log("Attribution received.  Payload: \(String(describing: payload), privacy: .private)")
+            return payload
 
         case 400:
-            // invalid token
             throw AttributionPayloadFetchError.status400InvalidToken
 
         case 404:
-            // Not found - could be retried
             throw AttributionPayloadFetchError.status404NotFound
 
         case 500:
-            // Server unavailable
             throw AttributionPayloadFetchError.status500ServerUnavailable
 
         default:
-            let statusCodeText = "\(urlResponse.statusCode)"
-            logger.error("Received unexpected HTTP status code \(statusCodeText) - response ignored")
-            logJSON()
+            logger.error("Received unexpected HTTP status code \(urlResponse.statusCode) - response ignored")
+            logResponseBody()
             throw AttributionPayloadFetchError.unknownHTTPStatusCodeInResponse
         }
     }
@@ -209,8 +218,11 @@ public class NCCOpenAppleSearchAdsInstallAttribution: ObservableObject {
     /// On success:
     ///    The newly-received `AttributionPayload` is compared with any previously saved attribution payload
     ///    If it differs or if no saved payload exists, the new payload is saved, stored in `attributionPayload`,
-    ///    and then the closure for `onAttributinoPayloadLoaded` is called, followed by the closure for
+    ///    and then the closure for `onAttributionPayloadLoaded` is called, followed by the closure for
     ///    `onNewAttributionPayloadReceived`.
+    ///
+    ///    Apple's API answers 404 when the record isn't available yet, which is common right after install.
+    ///    Following Apple's guidance, a 404 is retried up to 3 times in total, 5 seconds apart.
     ///
     /// - Parameters:
     ///   - onAttributionPayloadLoaded: A closure to be called any time an `AttributionPayload` is
@@ -223,34 +235,85 @@ public class NCCOpenAppleSearchAdsInstallAttribution: ObservableObject {
     ///
     /// On failure:
     ///    If any errors occur when fetching the `AttributionPayload`, the instance `@Published` variable `error`
-    ///    will be updated.  After an error, the fetch will not be retried.  Create a new instance to retry.
+    ///    will be updated.  Apart from the 404 retries above, the fetch will not be retried.  Create a new
+    ///    instance to retry.  When developer mode is on, Apple returns a test payload; it is not saved or
+    ///    reported, and `error` is set to `AttributionPayloadFetchError.mockDataReceived`.
     ///
     public init(_ onAttributionPayloadLoaded: @escaping (AttributionPayload) -> Void, onNewAttributionPayloadReceived: @escaping (AttributionPayload) -> Void) {
+        self.urlSession = .shared
+        self.userDefaults = .standard
         self.onAttributionPayloadLoaded = onAttributionPayloadLoaded
         self.onNewAttributionPayloadReceived = onNewAttributionPayloadReceived
+        startFetching(
+            attributionTokenProvider: { try await NCCOpenAppleSearchAdsInstallAttribution.getAttributionToken() },
+            notFoundRetryPolicy: .appleRecommended
+        )
+    }
 
-        Task {
+    /// Supplies the AdServices attribution token. Injectable so tests can run without AdServices.
+    typealias AttributionTokenProvider = @Sendable () async throws -> String
+
+    /// How to retry when Apple's API answers 404, which it does when the record isn't available yet.
+    struct NotFoundRetryPolicy: Sendable {
+        /// Total number of requests, including the first
+        let maximumAttempts: Int
+        /// Wait between attempts
+        let delay: Duration
+
+        /// Apple: "initiate retries at intervals of 5 seconds, with a maximum of 3 attempts"
+        static let appleRecommended = NotFoundRetryPolicy(maximumAttempts: 3, delay: .seconds(5))
+    }
+
+    /// The fetch started by `init`. Held so tests can await completion.
+    private(set) var fetchTask: Task<Void, Never>?
+
+    private let urlSession: URLSession
+    private let userDefaults: UserDefaults
+
+    /// Dependency-injecting initializer for tests.
+    init(
+        attributionTokenProvider: @escaping AttributionTokenProvider,
+        urlSession: URLSession,
+        userDefaults: UserDefaults,
+        notFoundRetryPolicy: NotFoundRetryPolicy,
+        onAttributionPayloadLoaded: @escaping (AttributionPayload) -> Void,
+        onNewAttributionPayloadReceived: @escaping (AttributionPayload) -> Void
+    ) {
+        self.urlSession = urlSession
+        self.userDefaults = userDefaults
+        self.onAttributionPayloadLoaded = onAttributionPayloadLoaded
+        self.onNewAttributionPayloadReceived = onNewAttributionPayloadReceived
+        startFetching(attributionTokenProvider: attributionTokenProvider, notFoundRetryPolicy: notFoundRetryPolicy)
+    }
+
+    /// Loads any saved payload, then fetches the current one. Called once, from `init`.
+    private func startFetching(attributionTokenProvider: @escaping AttributionTokenProvider, notFoundRetryPolicy: NotFoundRetryPolicy) {
+        fetchTask = Task {
             // Load saved attribution payload if exists
             if let savedAttributionPayload = self.savedAttributionPayload {
                 self.attributionPayload = savedAttributionPayload
                 self.onAttributionPayloadLoaded(savedAttributionPayload)
             }
 
+            let token: String
             do {
-                let token = try await self.getAttributionToken()
-                do {
-                    let payload = try await self.fetchAttributionRecord(token)
-                    if let payload, payload != self.savedAttributionPayload {
-                        self.attributionPayload = payload
-                        self.savedAttributionPayload = payload
-                        self.onAttributionPayloadLoaded(payload)
-                        self.onNewAttributionPayloadReceived(payload)
-                    }
-                } catch {
-                    logger.error("Error fetching ad attribution record: \(error)")
-                }
+                token = try await attributionTokenProvider()
             } catch {
                 logger.error("Error getting ad attribution token: \(error)")
+                self.error = error
+                return
+            }
+            do {
+                let payload = try await Self.fetchAttributionRecord(token, using: self.urlSession, notFoundRetryPolicy: notFoundRetryPolicy)
+                if let payload, payload != self.savedAttributionPayload {
+                    self.attributionPayload = payload
+                    self.savedAttributionPayload = payload
+                    self.onAttributionPayloadLoaded(payload)
+                    self.onNewAttributionPayloadReceived(payload)
+                }
+            } catch {
+                logger.error("Error fetching ad attribution record: \(error)")
+                self.error = error
             }
         }
     }

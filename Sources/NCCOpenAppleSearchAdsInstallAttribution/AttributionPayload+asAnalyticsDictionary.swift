@@ -39,6 +39,15 @@ extension NCCOpenAppleSearchAdsInstallAttribution.AttributionPayload {
         if let clickDate {
             dict["ASAClickDate"] = clickDate
         }
+        if let claimType {
+            dict["ASAClaimType"] = claimType.rawValue
+        }
+        if let impressionDate {
+            dict["ASAImpressionDate"] = impressionDate
+        }
+        if let supplyPlacement {
+            dict["ASASupplyPlacement"] = supplyPlacement.rawValue
+        }
 
         return dict
     }
